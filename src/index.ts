@@ -187,6 +187,16 @@ async function loadCredentials() {
             const tokens = credentials.tokens || credentials;
             oauth2Client.setCredentials(tokens);
 
+            // Auto-refresh expired access_token on startup (avoids crash at first API call)
+            if (tokens.expiry_date && tokens.expiry_date < Date.now()) {
+                try {
+                    await oauth2Client.getAccessToken();
+                    console.error('[gmail-mcp] Access token refreshed on startup');
+                } catch (refreshError: any) {
+                    console.error('[gmail-mcp] Warning: startup token refresh failed:', refreshError.message);
+                }
+            }
+
             if (credentials.scopes) {
                 authorizedScopes = credentials.scopes;
             }
