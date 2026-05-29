@@ -19,7 +19,7 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, ForwardEmailSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1505,6 +1505,135 @@ async function main() {
                             {
                                 type: "text",
                                 text: `Reply-all sent successfully!\nTo: ${replyTo.join(', ')}${replyCc.length > 0 ? `\nCC: ${replyCc.join(', ')}` : ''}\nSubject: ${replySubject}\nThread ID: ${threadId}`,
+                            },
+                        ],
+                    };
+                }
+
+                case "forward_email": {
+                    const validatedArgs = ForwardEmailSchema.parse(args);
+
+                    // Fetch original email
+                    const originalEmail = await gmail.users.messages.get({
+                        userId: 'me',
+                        id: validatedArgs.messageId,
+                        format: 'full',
+                    });
+
+                    const fwdHeaders = originalEmail.data.payload?.headers || [];
+                    const fwdFrom    = fwdHeaders.find(h => h.name?.toLowerCase() === 'from')?.value || '';
+                    const fwdTo      = fwdHeaders.find(h => h.name?.toLowerCase() === 'to')?.value || '';
+                    const fwdDate    = fwdHeaders.find(h => h.name?.toLowerCase() === 'date')?.value || '';
+                    const fwdSubject = fwdHeaders.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
+
+                    // Build Fwd: subject
+                    const forwardSubject = fwdSubject.startsWith('Fwd:') ? fwdSubject : `Fwd: ${fwdSubject}`;
+
+                    // Extract plain text body from original
+                    function extractTextBody(payload: any): string {
+                        if (!payload) return '';
+                        if (payload.mimeType === 'text/plain' && payload.body?.data) {
+                            return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+                        }
+                        if (payload.parts) {
+                            for (const part of payload.parts) {
+                                const text = extractTextBody(part);
+                                if (text) return text;
+                            }
+                        }
+                        return '';
+                    }
+
+                    function extractHtmlBody(payload: any): string {
+                        if (!payload) return '';
+                        if (payload.mimeType === 'text/html' && payload.body?.data) {
+                            return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+                        }
+                        if (payload.parts) {
+                            for (const part of payload.parts) {
+                                const html = extractHtmlBody(part);
+                                if (html) return html;
+                            }
+                        }
+                        return '';
+                    }
+
+                    const originalTextBody = extractTextBody(originalEmail.data.payload);
+                    const originalHtmlBody = extractHtmlBody(originalEmail.data.payload);
+
+                    // Build quoted forwarded block (plain text)
+                    const fwdQuoteHeader =
+                        `---------- Forwarded message ---------\n` +
+                        `From: ${fwdFrom}\n` +
+                        `Date: ${fwdDate}\n` +
+                        `Subject: ${fwdSubject}\n` +
+                        `To: ${fwdTo}\n\n`;
+
+                    const plainBody = (validatedArgs.additionalBody ? validatedArgs.additionalBody + '\n\n' : '') +
+                        fwdQuoteHeader + originalTextBody;
+
+                    // Build HTML quoted block if needed
+                    const fwdQuoteHeaderHtml =
+                        `<div style="border-left:1px solid #ccc;padding-left:10px;margin-top:12px;color:#555;font-size:13px;">` +
+                        `<p><b>---------- Forwarded message ---------</b><br>` +
+                        `<b>From:</b> ${fwdFrom}<br>` +
+                        `<b>Date:</b> ${fwdDate}<br>` +
+                        `<b>Subject:</b> ${fwdSubject}<br>` +
+                        `<b>To:</b> ${fwdTo}</p>` +
+                        (originalHtmlBody || `<p>${originalTextBody.replace(/\n/g, '<br>')}</p>`) +
+                        `</div>`;
+
+                    const htmlBody = (validatedArgs.additionalHtmlBody ? validatedArgs.additionalHtmlBody : (validatedArgs.additionalBody ? `<p>${validatedArgs.additionalBody}</p>` : '')) +
+                        fwdQuoteHeaderHtml;
+
+                    // Download original attachments to temp dir if requested
+                    const tempAttachmentPaths: string[] = [];
+                    if (validatedArgs.includeAttachments !== false) {
+                        const originalAttachments = extractAttachments(originalEmail.data.payload as GmailMessagePart);
+                        for (const att of originalAttachments) {
+                            try {
+                                const attData = await gmail.users.messages.attachments.get({
+                                    userId: 'me',
+                                    messageId: validatedArgs.messageId,
+                                    id: att.id,
+                                });
+                                const rawData = attData.data.data || '';
+                                // Gmail uses URL-safe base64 — normalize to standard base64
+                                const buffer = Buffer.from(rawData.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+                                const tempPath = path.join(os.tmpdir(), `fwd_${validatedArgs.messageId}_${att.filename}`);
+                                fs.writeFileSync(tempPath, buffer);
+                                tempAttachmentPaths.push(tempPath);
+                            } catch (attErr: any) {
+                                console.error(`[forward_email] Could not download attachment ${att.filename}: ${attErr.message}`);
+                            }
+                        }
+                    }
+
+                    const fwdMimeType = validatedArgs.mimeType || 'text/plain';
+
+                    const emailArgs: any = {
+                        to: validatedArgs.to,
+                        cc: validatedArgs.cc,
+                        bcc: validatedArgs.bcc,
+                        subject: forwardSubject,
+                        body: plainBody,
+                        mimeType: fwdMimeType,
+                        ...(fwdMimeType !== 'text/plain' && { htmlBody }),
+                        ...(tempAttachmentPaths.length > 0 && { attachments: tempAttachmentPaths }),
+                    };
+
+                    const fwdResult = await handleEmailAction("send", emailArgs);
+
+                    // Cleanup temp files
+                    for (const p of tempAttachmentPaths) {
+                        try { fs.unlinkSync(p); } catch {}
+                    }
+
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Forward sent successfully!\nTo: ${validatedArgs.to.join(', ')}${validatedArgs.cc && validatedArgs.cc.length > 0 ? `\nCC: ${validatedArgs.cc.join(', ')}` : ''}\nSubject: ${forwardSubject}${tempAttachmentPaths.length > 0 ? `\nAttachments forwarded: ${tempAttachmentPaths.length}` : ''}`,
                             },
                         ],
                     };

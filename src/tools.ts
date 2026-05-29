@@ -163,6 +163,17 @@ export const ReplyAllSchema = z.object({
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
 });
 
+export const ForwardEmailSchema = z.object({
+  messageId: z.string().describe("ID of the email message to forward"),
+  to: z.array(z.string()).describe("List of recipient email addresses"),
+  cc: z.array(z.string()).optional().describe("List of CC recipients"),
+  bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
+  additionalBody: z.string().optional().describe("Optional text to prepend above the forwarded message"),
+  additionalHtmlBody: z.string().optional().describe("Optional HTML to prepend above the forwarded message (used when mimeType is multipart/alternative or text/html)"),
+  mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
+  includeAttachments: z.boolean().optional().default(true).describe("Whether to include original email attachments (default: true)"),
+});
+
 // Tool definition type
 export interface ToolAnnotations {
   title: string;
@@ -367,6 +378,13 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: ReplyAllSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
+  },
+  {
+    name: "forward_email",
+    description: "Forwards an existing email to new recipients. Automatically builds the 'Fwd:' subject, quotes the original message with headers (From, Date, Subject, To), and optionally re-attaches the original email's attachments.",
+    schema: ForwardEmailSchema,
+    scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
+    annotations: { title: "Forward Email", destructiveHint: false },
   },
 ];
 
