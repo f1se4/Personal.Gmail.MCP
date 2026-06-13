@@ -295,6 +295,23 @@ async function main() {
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
+    // Cached authenticated user email (avoids repeated getProfile calls)
+    let _cachedUserEmail: string | null = null;
+
+    // Concurrency-limited parallel execution (prevents Gmail API rate limit bursts)
+    async function chunkedParallel<T, R>(
+        items: T[],
+        fn: (item: T) => Promise<R>,
+        chunkSize = 10
+    ): Promise<R[]> {
+        const results: R[] = [];
+        for (let i = 0; i < items.length; i += chunkSize) {
+            const chunk = items.slice(i, i + chunkSize);
+            results.push(...await Promise.all(chunk.map(fn)));
+        }
+        return results;
+    }
+
     // Server implementation
     const server = new Server(
         {
@@ -579,23 +596,21 @@ async function main() {
                     });
 
                     const messages = response.data.messages || [];
-                    const results = await Promise.all(
-                        messages.map(async (msg) => {
-                            const detail = await gmail.users.messages.get({
-                                userId: 'me',
-                                id: msg.id!,
-                                format: 'metadata',
-                                metadataHeaders: ['Subject', 'From', 'Date'],
-                            });
-                            const headers = detail.data.payload?.headers || [];
-                            return {
-                                id: msg.id,
-                                subject: headers.find(h => h.name === 'Subject')?.value || '',
-                                from: headers.find(h => h.name === 'From')?.value || '',
-                                date: headers.find(h => h.name === 'Date')?.value || '',
-                            };
-                        })
-                    );
+                    const results = await chunkedParallel(messages, async (msg) => {
+                        const detail = await gmail.users.messages.get({
+                            userId: 'me',
+                            id: msg.id!,
+                            format: 'metadata',
+                            metadataHeaders: ['Subject', 'From', 'Date'],
+                        });
+                        const headers = detail.data.payload?.headers || [];
+                        return {
+                            id: msg.id,
+                            subject: headers.find(h => h.name === 'Subject')?.value || '',
+                            from: headers.find(h => h.name === 'From')?.value || '',
+                            date: headers.find(h => h.name === 'Date')?.value || '',
+                        };
+                    });
 
                     return {
                         content: [
@@ -1204,32 +1219,30 @@ async function main() {
                     const threads = threadsResponse.data.threads || [];
 
                     // Fetch metadata for each thread to get message count and latest message info
-                    const threadDetails = await Promise.all(
-                        threads.map(async (thread) => {
-                            const detail = await gmail.users.threads.get({
-                                userId: 'me',
-                                id: thread.id!,
-                                format: 'metadata',
-                                metadataHeaders: ['Subject', 'From', 'Date'],
-                            });
+                    const threadDetails = await chunkedParallel(threads, async (thread) => {
+                        const detail = await gmail.users.threads.get({
+                            userId: 'me',
+                            id: thread.id!,
+                            format: 'metadata',
+                            metadataHeaders: ['Subject', 'From', 'Date'],
+                        });
 
-                            const messages = detail.data.messages || [];
-                            const latestMessage = messages[messages.length - 1];
-                            const latestHeaders = latestMessage?.payload?.headers || [];
+                        const messages = detail.data.messages || [];
+                        const latestMessage = messages[messages.length - 1];
+                        const latestHeaders = latestMessage?.payload?.headers || [];
 
-                            return {
-                                threadId: thread.id || '',
-                                snippet: thread.snippet || '',
-                                historyId: thread.historyId || '',
-                                messageCount: messages.length,
-                                latestMessage: {
-                                    from: latestHeaders.find(h => h.name === 'From')?.value || '',
-                                    subject: latestHeaders.find(h => h.name === 'Subject')?.value || '',
-                                    date: latestHeaders.find(h => h.name === 'Date')?.value || '',
-                                },
-                            };
-                        })
-                    );
+                        return {
+                            threadId: thread.id || '',
+                            snippet: thread.snippet || '',
+                            historyId: thread.historyId || '',
+                            messageCount: messages.length,
+                            latestMessage: {
+                                from: latestHeaders.find(h => h.name === 'From')?.value || '',
+                                subject: latestHeaders.find(h => h.name === 'Subject')?.value || '',
+                                date: latestHeaders.find(h => h.name === 'Date')?.value || '',
+                            },
+                        };
+                    });
 
                     return {
                         content: [
@@ -1256,8 +1269,7 @@ async function main() {
 
                     if (!validatedArgs.expandThreads) {
                         // Return basic thread list without expansion (same as list_inbox_threads)
-                        const threadSummaries = await Promise.all(
-                            threads.map(async (thread) => {
+                        const threadSummaries = await chunkedParallel(threads, async (thread) => {
                                 const detail = await gmail.users.threads.get({
                                     userId: 'me',
                                     id: thread.id!,
@@ -1280,8 +1292,7 @@ async function main() {
                                         date: latestHeaders.find(h => h.name === 'Date')?.value || '',
                                     },
                                 };
-                            })
-                        );
+                            });
 
                         return {
                             content: [
@@ -1296,9 +1307,8 @@ async function main() {
                         };
                     }
 
-                    // Expand each thread with full message content (parallel fetch)
-                    const expandedThreads = await Promise.all(
-                        threads.map(async (thread) => {
+                    // Expand each thread with full message content (parallel fetch, rate-limited)
+                    const expandedThreads = await chunkedParallel(threads, async (thread) => {
                             const threadDetail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1363,8 +1373,7 @@ async function main() {
                                 messageCount: messages.length,
                                 messages,
                             };
-                        })
-                    );
+                        });
 
                     return {
                         content: [
@@ -1400,9 +1409,12 @@ async function main() {
                     const originalMessageId = headers.find(h => h.name?.toLowerCase() === 'message-id')?.value || '';
                     const originalReferences = headers.find(h => h.name?.toLowerCase() === 'references')?.value || '';
 
-                    // Get authenticated user's email to exclude from recipients
-                    const profile = await gmail.users.getProfile({ userId: 'me' });
-                    const myEmail = profile.data.emailAddress?.toLowerCase() || '';
+                    // Get authenticated user's email (cached to avoid repeated API calls)
+                    if (!_cachedUserEmail) {
+                        const profile = await gmail.users.getProfile({ userId: 'me' });
+                        _cachedUserEmail = profile.data.emailAddress?.toLowerCase() || '';
+                    }
+                    const myEmail = _cachedUserEmail;
 
                     // Build recipient list using helper functions
                     const { to: replyTo, cc: replyCc } = buildReplyAllRecipients(
