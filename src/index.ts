@@ -766,104 +766,43 @@ async function main() {
                 case "batch_modify_emails": {
                     const validatedArgs = BatchModifyEmailsSchema.parse(args);
                     const messageIds = validatedArgs.messageIds;
-                    const batchSize = validatedArgs.batchSize || 50;
-                    
-                    // Prepare request body
-                    const requestBody: any = {};
-                    
-                    if (validatedArgs.addLabelIds) {
-                        requestBody.addLabelIds = validatedArgs.addLabelIds;
-                    }
-                    
-                    if (validatedArgs.removeLabelIds) {
-                        requestBody.removeLabelIds = validatedArgs.removeLabelIds;
-                    }
-
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
-                        messageIds,
-                        batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    const result = await gmail.users.messages.modify({
-                                        userId: 'me',
-                                        id: messageId,
-                                        requestBody: requestBody,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
-                    );
-
-                    // Generate summary of the operation
-                    const successCount = successes.length;
-                    const failureCount = failures.length;
-                    
-                    let resultText = `Batch label modification complete.\n`;
-                    resultText += `Successfully processed: ${successCount} messages\n`;
-                    
-                    if (failureCount > 0) {
-                        resultText += `Failed to process: ${failureCount} messages\n\n`;
-                        resultText += `Failed message IDs:\n`;
-                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
-                    }
-
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: resultText,
+                    // Gmail API batchModify: single request for up to 1000 ids
+                    // For larger sets, chunk into 1000-id batches
+                    const CHUNK = 1000;
+                    let processed = 0;
+                    for (let i = 0; i < messageIds.length; i += CHUNK) {
+                        const chunk = messageIds.slice(i, i + CHUNK);
+                        await gmail.users.messages.batchModify({
+                            userId: 'me',
+                            requestBody: {
+                                ids: chunk,
+                                addLabelIds: validatedArgs.addLabelIds ?? [],
+                                removeLabelIds: validatedArgs.removeLabelIds ?? [],
                             },
-                        ],
+                        });
+                        processed += chunk.length;
+                    }
+                    return {
+                        content: [{ type: "text", text: `Batch label modification complete. Processed: ${processed} messages` }],
                     };
                 }
 
                 case "batch_delete_emails": {
                     const validatedArgs = BatchDeleteEmailsSchema.parse(args);
                     const messageIds = validatedArgs.messageIds;
-                    const batchSize = validatedArgs.batchSize || 50;
-
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
-                        messageIds,
-                        batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    await gmail.users.messages.delete({
-                                        userId: 'me',
-                                        id: messageId,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
-                    );
-
-                    // Generate summary of the operation
-                    const successCount = successes.length;
-                    const failureCount = failures.length;
-                    
-                    let resultText = `Batch delete operation complete.\n`;
-                    resultText += `Successfully deleted: ${successCount} messages\n`;
-                    
-                    if (failureCount > 0) {
-                        resultText += `Failed to delete: ${failureCount} messages\n\n`;
-                        resultText += `Failed message IDs:\n`;
-                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+                    // Gmail API batchDelete: single request for up to 1000 ids
+                    const CHUNK = 1000;
+                    let deleted = 0;
+                    for (let i = 0; i < messageIds.length; i += CHUNK) {
+                        const chunk = messageIds.slice(i, i + CHUNK);
+                        await gmail.users.messages.batchDelete({
+                            userId: 'me',
+                            requestBody: { ids: chunk },
+                        });
+                        deleted += chunk.length;
                     }
-
                     return {
-                        content: [
-                            {
-                                type: "text",
-                                text: resultText,
-                            },
-                        ],
+                        content: [{ type: "text", text: `Batch delete complete. Deleted: ${deleted} messages` }],
                     };
                 }
 
